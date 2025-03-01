@@ -1,3 +1,7 @@
+import os
+from pathlib import Path
+from functools import partial
+import shutil
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
@@ -25,6 +29,23 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
     self._tokenizer_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tokenizer")
     self.session = {}
     self._shard_lock = asyncio.Lock()
+
+    # Initialize with existing local models
+    self.local_model_dir = Path.home() / ".cache/exo/downloads"
+    self._loaded_shards = {}  # Initialize here before scanning
+    self.local_registry = {}  # Initialize here before scanning
+
+    self._scan_local_models()
+
+  def _scan_local_models(self):
+    """Populate initial registry of local models"""
+    if not self.local_model_dir.exists():
+      print(f"Local model directory {self.local_model_dir} does not exist.")
+      return
+    for model_dir in self.local_model_dir.glob("*"):
+      if model_dir.is_dir() and (model_dir / "config.json").exists():
+        self._loaded_shards[model_dir.name] = model_dir
+        print(f"Loaded local model: {model_dir}")
 
   async def _eval_mlx(self, *args):
     await asyncio.get_running_loop().run_in_executor(self._mlx_thread, mx.eval, *args)
@@ -160,6 +181,20 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
   async def ensure_shard(self, shard: Shard):
     async with self._shard_lock:
       if self.shard == shard: return
+      # First try direct local cache load
+      local_path = self.local_model_dir / shard.model_id
+      if local_path.exists():
+        try:
+          model_shard, self.tokenizer = await self._load_local_shard(local_path, shard)
+          self._update_model_state(shard, model_shard)
+          return
+        except Exception as e:
+          print(f"Local load failed: {e}")
+          # Remove corrupted local files
+          if local_path.exists():
+            shutil.rmtree(local_path)
+            # Now fall back to download
+      ##Fallback
       model_path = await self.shard_downloader.ensure_shard(shard, self.__class__.__name__)
       if self.shard != shard:
         model_shard = await asyncio.get_running_loop().run_in_executor(
@@ -174,6 +209,80 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
         self.model = model_shard
         self.caches = OrderedDict()
         self.session = {}
-
+  
   async def cleanup(self):
     self._mlx_thread.shutdown(wait=True)
+    # Add this to prevent resource leaks
+    self._tokenizer_thread.shutdown(wait=True)
+    self.shard = None
+    self.model = None
+    self.caches = None
+    self.session = None
+
+  async def _load_local_shard(self, model_path: Path, shard: Shard):
+        """Direct local model loading without registry checks"""
+        if not (model_path / "config.json").exists():
+            raise FileNotFoundError("Missing config.json in local model")
+        
+        return (
+            await asyncio.get_running_loop().run_in_executor(
+                self._mlx_thread,
+                partial(load_model_shard, model_path, shard, lazy=False)
+            ),
+            await resolve_tokenizer(model_path)
+        )
+
+  def _update_model_state(self, shard: Shard, model_shard):
+        """Update state with loaded shard"""
+        self.shard = shard
+        self.model = model_shard
+        self.stateful_sharded_model = StatefulShardedModel(shard, model_shard)
+        self.caches = OrderedDict()
+        self.session = {}
+
+  async def _process_downloaded_shard(self, shard: Shard, model_path: Path):
+        """Handle downloaded models and local registration"""
+        if self.shard != shard:
+            model_shard = await asyncio.get_running_loop().run_in_executor(
+                self._mlx_thread,
+                partial(load_model_shard, model_path, shard, lazy=False)
+            )
+            self._update_model_state(shard, model_shard)
+            
+            # Register in local cache
+            local_dir = self.local_model_dir / shard.model_id
+            if not local_dir.exists():
+                local_dir.mkdir(parents=True)
+                for f in model_path.glob("*"):
+                    if f.is_file():
+                        os.link(f, local_dir / f.name)
+                self.local_registry[shard.model_id] = local_dir
+
+class StatefulShardedModel:
+    """Manages runtime state for a loaded model shard"""
+    
+    def __init__(self, shard: Shard, model: nn.Module):
+        self.shard = shard
+        self.model = model
+        self.cache = None  # For attention layer caching
+        
+        # Initialize cache for attention layers
+        self.cache = [None] * (self.shard.end_layer - self.shard.start_layer + 1)
+        
+    def __call__(self, inputs: mx.array):
+        """Execute the model shard with current cache"""
+        outputs = inputs
+        new_cache = []
+        
+        # Process only the layers in this shard's range
+        for layer_idx in range(self.shard.start_layer, self.shard.end_layer + 1):
+            layer = self.model.layers[layer_idx]
+            outputs, layer_cache = layer(outputs, self.cache[layer_idx] if self.cache else None)
+            new_cache.append(layer_cache)
+            
+        self.cache = new_cache
+        return outputs
+    
+    def reset(self):
+        """Reset state between generations"""
+        self.cache = None

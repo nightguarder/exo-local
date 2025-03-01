@@ -16,10 +16,7 @@ import traceback
 
 import mlx.core as mx
 import mlx.nn as nn
-from transformers import AutoProcessor
-
 from mlx_lm.tokenizer_utils import load_tokenizer, TokenizerWrapper
-
 from exo import DEBUG
 from exo.inference.tokenizers import resolve_tokenizer
 from ..shard import Shard
@@ -111,6 +108,9 @@ def load_model_shard(
     "end_layer": shard.end_layer,
     "n_layers": shard.n_layers,
   }
+  print(f"Loading shard: {shard}")  # Add this
+  print(f"Model type: {config['model_type']}") 
+  print(f"Layers loaded: {shard.start_layer}-{shard.end_layer}")
 
   weight_files = glob.glob(str(model_path/"model*.safetensors"))
 
