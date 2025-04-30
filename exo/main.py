@@ -1,3 +1,21 @@
+import os
+import sys
+import venv
+import site
+
+# Add venv check at the top of the file, before other imports
+def check_virtual_env():
+    """Check if running in a virtual environment and warn if not"""
+    in_venv = sys.prefix != sys.base_prefix
+    if not in_venv:
+        print("\033[93mWARNING: Not running in a virtual environment!\033[0m")
+        print("\033[93mThis may cause issues with model selection and dependencies.\033[0m")
+        print("\033[93mRecommended: Use the run_exo.sh script instead.\033[0m")
+        print()
+
+# Run check
+check_virtual_env()
+
 import argparse
 import asyncio
 import atexit
@@ -32,6 +50,7 @@ import uvloop
 import concurrent.futures
 import resource
 import psutil
+from exo.local_models import register_all_local_models
 
 # TODO: figure out why this is happening
 os.environ["GRPC_VERBOSITY"] = "error"
@@ -91,7 +110,15 @@ parser.add_argument("--tailnet-name", type=str, default=None, help="Tailnet name
 parser.add_argument("--node-id-filter", type=str, default=None, help="Comma separated list of allowed node IDs (only for UDP and Tailscale discovery)")
 parser.add_argument("--interface-type-filter", type=str, default=None, help="Comma separated list of allowed interface types (only for UDP discovery)")
 parser.add_argument("--system-prompt", type=str, default=None, help="System prompt for the ChatGPT API")
+# Add the --offline flag explicitly
+parser.add_argument("--offline", action="store_true", help="Run in offline mode (only use locally available models)")
 args = parser.parse_args()
+
+# Set offline mode environment variable if the flag is provided
+if args.offline:
+    os.environ["EXO_OFFLINE"] = "1"
+    print("\033[1;33m🔌 OFFLINE MODE ENABLED - Only using locally available models\033[0m")
+
 print(f"Selected inference engine: {args.inference_engine}")
 
 print_yellow_exo()
@@ -323,6 +350,14 @@ async def main():
 
   try: await check_exo_home()
   except Exception as e: print(f"Error checking exo home directory: {e}")
+
+  # Register local models first
+  try:
+    await register_all_local_models()
+  except Exception as e:
+    print(f"Error registering local models: {e}")
+    if DEBUG >= 1:
+      traceback.print_exc()
 
   if not args.models_seed_dir is None:
     try:

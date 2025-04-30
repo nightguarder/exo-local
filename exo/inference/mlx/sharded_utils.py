@@ -21,6 +21,15 @@ from exo import DEBUG
 from exo.inference.tokenizers import resolve_tokenizer
 from ..shard import Shard
 
+# Add the missing import for AutoProcessor
+try:
+    from transformers import AutoProcessor
+except ImportError:
+    # Create a placeholder if transformers is not installed
+    class AutoProcessor:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            raise ImportError("transformers library is required for AutoProcessor functionality")
 
 class ModelNotFoundError(Exception):
   def __init__(self, message):
@@ -44,15 +53,48 @@ def _get_classes(config: dict):
   Returns:
    A tuple containing the Model class and the ModelArgs class.
   """
-  model_type = config["model_type"]
+  model_type = config.get("model_type", "")
+  model_id = config.get("shard", {}).get("model_id", "")
+  
+  print(f"Getting model classes for model_type: {model_type}, model_id: {model_id}")
+  
+  # Try to determine model type from configuration and model name
+  if not model_type:
+    # Check model ID first for better identification
+    if model_id:
+      if "mistral" in model_id.lower():
+        model_type = "mistral"
+        print(f"Identified model as mistral based on model_id: {model_id}")
+      elif "llama" in model_id.lower():
+        model_type = "llama"
+      elif "qwen" in model_id.lower():
+        model_type = "qwen"
+    
+    # If still not determined, try config keys
+    if not model_type:
+      if "hidden_size" in config and "num_hidden_layers" in config:
+        if "num_key_value_heads" in config and "num_attention_heads" in config:
+          if "rope_theta" in config:
+            model_type = "llama"  # Likely a Llama-style architecture
+  
+  # Apply model remapping for architecture compatibility
+  original_type = model_type
   model_type = MODEL_REMAPPING.get(model_type, model_type)
+  if original_type != model_type:
+    print(f"Remapped model type from {original_type} to {model_type}")
+  
   try:
     arch = importlib.import_module(f"exo.inference.mlx.models.{model_type}")
   except ImportError:
-    msg = f"Model type {model_type} not supported."
-    logging.error(msg)
-    traceback.print_exc()
-    raise ValueError(msg)
+    msg = f"Model type {model_type} not supported. Trying llama as fallback."
+    logging.warning(msg)
+    try:
+      # Many models are llama-compatible, so try that as a fallback
+      arch = importlib.import_module(f"exo.inference.mlx.models.llama")
+    except ImportError:
+      logging.error("Llama fallback also failed.")
+      traceback.print_exc()
+      raise ValueError(f"Model type {model_type} not supported and llama fallback failed.")
 
   return arch.Model, arch.ModelArgs
 
@@ -63,6 +105,13 @@ def load_config(model_path: Path) -> dict:
     if config_path.exists():
       with open(config_path, "r") as f:
         config = json.load(f)
+      
+      # Add model_type if not present but can be inferred from path
+      if "model_type" not in config:
+        if "mistral" in str(model_path).lower():
+          config["model_type"] = "mistral"
+          print(f"Inferred model_type='mistral' from path: {model_path}")
+      
       return config
     
     model_index_path = model_path / "model_index.json"
@@ -99,24 +148,33 @@ def load_model_shard(
    ValueError: If the model class or args class are not found or cannot be instantiated.
   """
   config = load_config(model_path)
+  print(f"Loaded config from {model_path}: model_type={config.get('model_type', 'not specified')}")
   config.update(model_config)
 
+  # Add default model_type for Mistral models if not present
+  if "model_type" not in config:
+    if "mistral" in str(model_path).lower() or "mistral" in shard.model_id.lower():
+      config["model_type"] = "mistral"
+      print(f"Set model_type to 'mistral' for {shard.model_id}")
+    
   # TODO hack
   config["shard"] = {
-    "model_id": model_path.name,
+    "model_id": shard.model_id,
     "start_layer": shard.start_layer,
     "end_layer": shard.end_layer,
     "n_layers": shard.n_layers,
   }
-  print(f"Loading shard: {shard}")  # Add this
-  print(f"Model type: {config['model_type']}") 
-  print(f"Layers loaded: {shard.start_layer}-{shard.end_layer}")
+  print(f"Loading model with config: model_type={config.get('model_type', 'unknown')}, layers={shard.start_layer}-{shard.end_layer}/{shard.n_layers}")
 
   weight_files = glob.glob(str(model_path/"model*.safetensors"))
 
   if not weight_files:
     # Try weight for back-compat
     weight_files = glob.glob(str(model_path/"weight*.safetensors"))
+    
+    # For HuggingFace standard format
+    if not weight_files:
+      weight_files = glob.glob(str(model_path/"*.safetensors"))
 
   model_class, model_args_class = _get_classes(config=config)
 

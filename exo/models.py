@@ -154,6 +154,23 @@ model_cards = {
   "dummy": { "layers": 8, "repo": { "DummyInferenceEngine": "dummy", }, },
 }
 
+# Dictionary to store dynamically registered local models
+local_models = {}
+
+def register_local_model(model_id: str, config: dict):
+    """Register a local model that isn't in the standard model_cards"""
+    if model_id in local_models:
+        return  # Already registered
+    
+    # Store model info in the local_models dictionary
+    local_models[model_id] = config
+    
+    # Add pretty name for the model
+    if model_id not in pretty_name:
+        # Extract a sensible display name from the model_id
+        display_name = model_id.split('/')[-1].replace('-', ' ').title()
+        pretty_name[model_id] = f"{display_name} (Local)"
+
 pretty_name = {
   "llama-3.3-70b": "Llama 3.3 70B",
   "llama-3.2-1b": "Llama 3.2 1B",
@@ -232,18 +249,108 @@ pretty_name = {
   "deepseek-r1-distill-qwen-32b-6bit": "DeepSeek R1 Distill Qwen 32B (6-bit)",
 }
 
+def normalize_model_id(model_id: str) -> str:
+    """Normalize model ID for consistent lookups"""
+    # First check if this is mlx-community--model format
+    if model_id.startswith('mlx-community--'):
+        return model_id.replace('--', '/', 1)
+    return model_id
+
+def is_valid_model(model_id: str, inference_engine_classname: str) -> bool:
+    """Check if a model is registered and valid for the given inference engine"""
+    normalized_id = normalize_model_id(model_id)
+    
+    # Check if model exists in standard model cards
+    model_config = model_cards.get(model_id) or model_cards.get(normalized_id)
+    if model_config and inference_engine_classname in model_config.get("repo", {}):
+        return True
+    
+    # Check if model exists in local models
+    local_config = local_models.get(model_id) or local_models.get(normalized_id)
+    if local_config and inference_engine_classname in local_config.get("repo", {}):
+        return True
+    
+    return False
+
 def get_repo(model_id: str, inference_engine_classname: str) -> Optional[str]:
-  return model_cards.get(model_id, {}).get("repo", {}).get(inference_engine_classname, None)
+    """Get repository for the given model ID and inference engine"""
+    normalized_id = normalize_model_id(model_id)
+    
+    # First try with the original model_id
+    repo = model_cards.get(model_id, {}).get("repo", {}).get(inference_engine_classname, None)
+    if repo:
+        return repo
+    
+    # Then try with the normalized ID for standard models
+    if normalized_id != model_id:
+        repo = model_cards.get(normalized_id, {}).get("repo", {}).get(inference_engine_classname, None)
+        if repo:
+            return repo
+    
+    # Then check local models with original ID
+    local_config = local_models.get(model_id, {})
+    local_repo = local_config.get("repo", {}).get(inference_engine_classname, None)
+    if local_repo:
+        return local_repo
+    
+    # Finally check local models with normalized ID
+    if normalized_id != model_id:
+        local_config = local_models.get(normalized_id, {})
+        local_repo = local_config.get("repo", {}).get(inference_engine_classname, None)
+        if local_repo:
+            return local_repo
+    
+    # If we're looking for a model that contains "mistral" in its name,
+    # we might be able to use mistral-compatible architectures
+    if "mistral" in model_id.lower() and inference_engine_classname == "MLXDynamicShardInferenceEngine":
+        # Only return a default repo for well-known Mistral variants
+        if any(x in model_id.lower() for x in ["7b", "instruct", "chat"]):
+            return "mlx-community/Mistral-7B-Instruct-v0.2-4bit"
+    
+    # No valid repo found - return None instead of model_id to prevent download attempts
+    return None
 
 def get_pretty_name(model_id: str) -> Optional[str]:
-  return pretty_name.get(model_id, None)
+    return pretty_name.get(model_id, model_id.split('/')[-1].replace('-', ' ').title())
 
 def build_base_shard(model_id: str, inference_engine_classname: str) -> Optional[Shard]:
-  repo = get_repo(model_id, inference_engine_classname)
-  n_layers = model_cards.get(model_id, {}).get("layers", 0)
-  if repo is None or n_layers < 1:
+    """Build a base shard for the given model ID and inference engine"""
+    normalized_id = normalize_model_id(model_id)
+    
+    # First check standard models with original ID
+    n_layers = model_cards.get(model_id, {}).get("layers", 0)
+    if n_layers > 0:
+        repo = get_repo(model_id, inference_engine_classname)
+        if repo is not None:
+            return Shard(model_id, 0, 0, n_layers)
+    
+    # Then try with normalized ID
+    if normalized_id != model_id:
+        n_layers = model_cards.get(normalized_id, {}).get("layers", 0)
+        if n_layers > 0:
+            repo = get_repo(normalized_id, inference_engine_classname)
+            if repo is not None:
+                return Shard(normalized_id, 0, 0, n_layers)
+    
+    # Then check local models with original ID
+    n_layers = local_models.get(model_id, {}).get("layers", 0)
+    if n_layers > 0:
+        return Shard(model_id, 0, 0, n_layers)
+    
+    # Then check local models with normalized ID
+    if normalized_id != model_id:
+        n_layers = local_models.get(normalized_id, {}).get("layers", 0)
+        if n_layers > 0:
+            return Shard(normalized_id, 0, 0, n_layers)
+    
+    # For completely unregistered models, try to infer from name
+    if "mistral" in model_id.lower():
+        if "7b" in model_id.lower():
+            return Shard(model_id, 0, 0, 32)  # Mistral 7B has 32 layers
+        if "22b" in model_id.lower() or "codestral" in model_id.lower():
+            return Shard(model_id, 0, 0, 48)  # Mistral Codestral 22B has 48 layers
+    
     return None
-  return Shard(model_id, 0, 0, n_layers)
 
 def build_full_shard(model_id: str, inference_engine_classname: str) -> Optional[Shard]:
   base_shard = build_base_shard(model_id, inference_engine_classname)
@@ -251,23 +358,31 @@ def build_full_shard(model_id: str, inference_engine_classname: str) -> Optional
   return Shard(base_shard.model_id, 0, base_shard.n_layers - 1, base_shard.n_layers)
 
 def get_supported_models(supported_inference_engine_lists: Optional[List[List[str]]] = None) -> List[str]:
-  if not supported_inference_engine_lists:
-    return list(model_cards.keys())
+    result = []
+    
+    # Get standard models
+    if not supported_inference_engine_lists:
+        result = list(model_cards.keys())
+    else:
+        from exo.inference.inference_engine import inference_engine_classes
+        supported_inference_engine_lists = [
+            [inference_engine_classes[engine] if engine in inference_engine_classes else engine for engine in engine_list]
+            for engine_list in supported_inference_engine_lists
+        ]
 
-  from exo.inference.inference_engine import inference_engine_classes
-  supported_inference_engine_lists = [
-    [inference_engine_classes[engine] if engine in inference_engine_classes else engine for engine in engine_list]
-    for engine_list in supported_inference_engine_lists
-  ]
+        def has_any_engine(model_info: dict, engine_list: List[str]) -> bool:
+            return any(engine in model_info.get("repo", {}) for engine in engine_list)
 
-  def has_any_engine(model_info: dict, engine_list: List[str]) -> bool:
-    return any(engine in model_info.get("repo", {}) for engine in engine_list)
+        def supports_all_engine_lists(model_info: dict) -> bool:
+            return all(has_any_engine(model_info, engine_list)
+                    for engine_list in supported_inference_engine_lists)
 
-  def supports_all_engine_lists(model_info: dict) -> bool:
-    return all(has_any_engine(model_info, engine_list)
-              for engine_list in supported_inference_engine_lists)
-
-  return [
-    model_id for model_id, model_info in model_cards.items()
-    if supports_all_engine_lists(model_info)
-  ]
+        result = [
+            model_id for model_id, model_info in model_cards.items()
+            if supports_all_engine_lists(model_info)
+        ]
+    
+    # Add local models
+    result.extend(local_models.keys())
+    
+    return result

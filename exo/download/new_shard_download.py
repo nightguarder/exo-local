@@ -78,13 +78,44 @@ async def fetch_file_list_with_cache(repo_id: str, revision: str = "main") -> Li
   async with aiofiles.open(cache_file, 'w') as f: await f.write(json.dumps(file_list))
   return file_list
 
+# Add this function to validate model IDs before attempting download
+def is_valid_repo_id(repo_id: str) -> bool:
+    """Check if a repository ID appears to be a valid model and not a system directory."""
+    # Skip common non-model directories
+    invalid_dirs = [
+        'venv', 'env', '.venv', '__pycache__', '.git', '.github', '.idea', '.vscode',
+        'bin', 'lib', 'include', 'share', 'man', 'tmp', 'temp', 'cache', '.cache',
+        'node_modules', 'dist', 'build', 'target', 'out', 'output', 'site-packages'
+    ]
+    
+    for invalid_dir in invalid_dirs:
+        if invalid_dir == repo_id.lower() or f"/{invalid_dir}" in repo_id.lower() or f"\\{invalid_dir}" in repo_id.lower():
+            if DEBUG >= 1:
+                print(f"Skipping invalid repository directory: {repo_id}")
+            return False
+    
+    # Skip directories that start with a dot (hidden directories)
+    parts = repo_id.split('/')
+    for part in parts:
+        if part.startswith('.'):
+            if DEBUG >= 1:
+                print(f"Skipping hidden directory: {repo_id}")
+            return False
+    
+    return True
+
 async def fetch_file_list_with_retry(repo_id: str, revision: str = "main", path: str = "") -> List[Dict[str, Union[str, int]]]:
-  n_attempts = 30
-  for attempt in range(n_attempts):
-    try: return await _fetch_file_list(repo_id, revision, path)
-    except Exception as e:
-      if attempt == n_attempts - 1: raise e
-      await asyncio.sleep(min(8, 0.1 * (2 ** attempt)))
+    # Validate repo_id before attempting to fetch
+    if not is_valid_repo_id(repo_id):
+        print(f"Invalid repository ID: {repo_id}")
+        return []
+        
+    n_attempts = 30
+    for attempt in range(n_attempts):
+        try: return await _fetch_file_list(repo_id, revision, path)
+        except Exception as e:
+            if attempt == n_attempts - 1: raise e
+            await asyncio.sleep(min(8, 0.1 * (2 ** attempt)))
 
 async def _fetch_file_list(repo_id: str, revision: str = "main", path: str = "") -> List[Dict[str, Union[str, int]]]:
   api_url = f"{get_hf_endpoint()}/api/models/{repo_id}/tree/{revision}"
@@ -177,9 +208,9 @@ def calculate_repo_progress(shard: Shard, repo_id: str, revision: str, file_prog
   status = "complete" if all(p.status == "complete" for p in file_progress.values()) else "in_progress" if any(p.status == "in_progress" for p in file_progress.values()) else "not_started"
   return RepoProgressEvent(shard, repo_id, revision, len([p for p in file_progress.values() if p.downloaded == p.total]), len(file_progress), all_downloaded_bytes, all_downloaded_bytes_this_session, all_total_bytes, all_speed, all_eta, file_progress, status)
 
-async def get_weight_map(repo_id: str, revision: str = "main") -> Dict[str, str]:
+async def get_weight_map(repo_id: str) -> Dict[str, str]:
   target_dir = (await ensure_exo_tmp())/repo_id.replace("/", "--")
-  index_file = await download_file_with_retry(repo_id, revision, "model.safetensors.index.json", target_dir)
+  index_file = await download_file_with_retry(repo_id, "main", "model.safetensors.index.json", target_dir)
   async with aiofiles.open(index_file, 'r') as f: index_data = json.loads(await f.read())
   return index_data.get("weight_map")
 
@@ -198,46 +229,71 @@ async def get_downloaded_size(path: Path) -> int:
   if await aios.path.exists(partial_path): return (await aios.stat(partial_path)).st_size
   return 0
 
+# Check if we're in offline mode - update with better detection
+OFFLINE_MODE = os.environ.get("EXO_OFFLINE", "0").lower() in ("1", "true", "yes")
+
 async def download_shard(shard: Shard, inference_engine_classname: str, on_progress: AsyncCallbackSystem[str, Tuple[Shard, RepoProgressEvent]], max_parallel_downloads: int = 8, skip_download: bool = False) -> tuple[Path, RepoProgressEvent]:
-  if DEBUG >= 2 and not skip_download: print(f"Downloading {shard.model_id=} for {inference_engine_classname}")
-  repo_id = get_repo(shard.model_id, inference_engine_classname)
-  revision = "main"
-  target_dir = await ensure_downloads_dir()/repo_id.replace("/", "--")
-  if not skip_download: await aios.makedirs(target_dir, exist_ok=True)
+    # Check for offline mode first, before any other operations
+    if OFFLINE_MODE:
+        print(f"OFFLINE MODE: Skipping download for {shard.model_id}")
+        # Create a "failed" progress event to indicate offline mode prevented download
+        offline_progress = RepoProgressEvent(
+            shard, "offline_mode", "main", 0, 0, 0, 0, 0, 0,
+            timedelta(0), {}, "skipped", "Offline mode enabled"
+        )
+        return await ensure_downloads_dir() / shard.model_id.replace("/", "--"), offline_progress
+        
+    if DEBUG >= 2 and not skip_download: print(f"Downloading {shard.model_id=} for {inference_engine_classname}")
+    
+    repo_id = get_repo(shard.model_id, inference_engine_classname)
+    
+    # Validate repo_id before continuing
+    if not is_valid_repo_id(repo_id):
+      print(f"Skipping download for invalid repository ID: {repo_id}")
+      # Return a path and an empty progress event to prevent errors
+      empty_progress = RepoProgressEvent(
+          shard, repo_id, "main", 0, 0, 0, 0, 0, 0, 
+          timedelta(0), {}, "failed"
+      )
+      return await ensure_downloads_dir() / repo_id.replace("/", "--"), empty_progress
+      
+    revision = "main"
+    target_dir = await ensure_downloads_dir()/repo_id.replace("/", "--")
+    if not skip_download: await aios.makedirs(target_dir, exist_ok=True)
 
-  if repo_id is None:
-    raise ValueError(f"No repo found for {shard.model_id=} and inference engine {inference_engine_classname}")
+    if repo_id is None:
+      raise ValueError(f"No repo found for {shard.model_id=} and inference engine {inference_engine_classname}")
 
-  allow_patterns = await resolve_allow_patterns(shard, inference_engine_classname)
-  if DEBUG >= 2: print(f"Downloading {shard.model_id=} with {allow_patterns=}")
+    allow_patterns = await resolve_allow_patterns(shard, inference_engine_classname)
+    if DEBUG >= 2: print(f"Downloading {shard.model_id=} with {allow_patterns=}")
 
-  all_start_time = time.time()
-  file_list = await fetch_file_list_with_cache(repo_id, revision)
-  filtered_file_list = list(filter_repo_objects(file_list, allow_patterns=allow_patterns, key=lambda x: x["path"]))
-  file_progress: Dict[str, RepoFileProgressEvent] = {}
-  def on_progress_wrapper(file: dict, curr_bytes: int, total_bytes: int):
-    start_time = file_progress[file["path"]].start_time if file["path"] in file_progress else time.time()
-    downloaded_this_session = file_progress[file["path"]].downloaded_this_session + (curr_bytes - file_progress[file["path"]].downloaded) if file["path"] in file_progress else curr_bytes
-    speed = downloaded_this_session / (time.time() - start_time) if time.time() - start_time > 0 else 0
-    eta = timedelta(seconds=(total_bytes - curr_bytes) / speed) if speed > 0 else timedelta(seconds=0)
-    file_progress[file["path"]] = RepoFileProgressEvent(repo_id, revision, file["path"], curr_bytes, downloaded_this_session, total_bytes, speed, eta, "complete" if curr_bytes == total_bytes else "in_progress", start_time)
-    on_progress.trigger_all(shard, calculate_repo_progress(shard, repo_id, revision, file_progress, all_start_time))
-    if DEBUG >= 6: print(f"Downloading {file['path']} {curr_bytes}/{total_bytes} {speed} {eta}")
-  for file in filtered_file_list:
-    downloaded_bytes = await get_downloaded_size(target_dir/file["path"])
-    file_progress[file["path"]] = RepoFileProgressEvent(repo_id, revision, file["path"], downloaded_bytes, 0, file["size"], 0, timedelta(0), "complete" if downloaded_bytes == file["size"] else "not_started", time.time())
+    all_start_time = time.time()
+    file_list = await fetch_file_list_with_cache(repo_id, revision)
+    filtered_file_list = list(filter_repo_objects(file_list, allow_patterns=allow_patterns, key=lambda x: x["path"]))
+    file_progress: Dict[str, RepoFileProgressEvent] = {}
+    def on_progress_wrapper(file: dict, curr_bytes: int, total_bytes: int):
+      start_time = file_progress[file["path"]].start_time if file["path"] in file_progress else time.time()
+      downloaded_this_session = file_progress[file["path"]].downloaded_this_session + (curr_bytes - file_progress[file["path"]].downloaded) if file["path"] in file_progress else curr_bytes
+      speed = downloaded_this_session / (time.time() - start_time) if time.time() - start_time > 0 else 0
+      eta = timedelta(seconds=(total_bytes - curr_bytes) / speed) if speed > 0 else timedelta(seconds=0)
+      file_progress[file["path"]] = RepoFileProgressEvent(repo_id, revision, file["path"], curr_bytes, downloaded_this_session, total_bytes, speed, eta, "complete" if curr_bytes == total_bytes else "in_progress", start_time)
+      on_progress.trigger_all(shard, calculate_repo_progress(shard, repo_id, revision, file_progress, all_start_time))
+      if DEBUG >= 6: print(f"Downloading {file['path']} {curr_bytes}/{total_bytes} {speed} {eta}")
+    for file in filtered_file_list:
+      downloaded_bytes = await get_downloaded_size(target_dir/file["path"])
+      file_progress[file["path"]] = RepoFileProgressEvent(repo_id, revision, file["path"], downloaded_bytes, 0, file["size"], 0, timedelta(0), "complete" if downloaded_bytes == file["size"] else "not_started", time.time())
 
-  semaphore = asyncio.Semaphore(max_parallel_downloads)
-  async def download_with_semaphore(file):
-    async with semaphore:
-      await download_file_with_retry(repo_id, revision, file["path"], target_dir, lambda curr_bytes, total_bytes: on_progress_wrapper(file, curr_bytes, total_bytes))
-  if not skip_download: await asyncio.gather(*[download_with_semaphore(file) for file in filtered_file_list])
-  final_repo_progress = calculate_repo_progress(shard, repo_id, revision, file_progress, all_start_time)
-  on_progress.trigger_all(shard, final_repo_progress)
-  if gguf := next((f for f in filtered_file_list if f["path"].endswith(".gguf")), None):
-    return target_dir/gguf["path"], final_repo_progress
-  else:
-    return target_dir, final_repo_progress
+    semaphore = asyncio.Semaphore(max_parallel_downloads)
+    async def download_with_semaphore(file):
+      async with semaphore:
+        await download_file_with_retry(repo_id, revision, file["path"], target_dir, lambda curr_bytes, total_bytes: on_progress_wrapper(file, curr_bytes, total_bytes))
+    if not skip_download: await asyncio.gather(*[download_with_semaphore(file) for file in filtered_file_list])
+    final_repo_progress = calculate_repo_progress(shard, repo_id, revision, file_progress, all_start_time)
+    on_progress.trigger_all(shard, final_repo_progress)
+    if gguf := next((f for f in filtered_file_list if f["path"].endswith(".gguf")), None):
+      return target_dir/gguf["path"], final_repo_progress
+    else:
+      return target_dir, final_repo_progress
 
 def new_shard_downloader(max_parallel_downloads: int = 8) -> ShardDownloader:
   return SingletonShardDownloader(CachedShardDownloader(NewShardDownloader(max_parallel_downloads)))
@@ -293,6 +349,21 @@ class NewShardDownloader(ShardDownloader):
     return self._on_progress
 
   async def ensure_shard(self, shard: Shard, inference_engine_name: str) -> Path:
+    # Check for offline mode
+    if OFFLINE_MODE:
+        local_path = await ensure_downloads_dir() / shard.model_id.replace("/", "--")
+        if local_path.exists():
+            print(f"OFFLINE MODE: Using local model {shard.model_id}")
+            return local_path
+        else:
+            print(f"OFFLINE MODE: Model {shard.model_id} not available locally")
+            return await ensure_downloads_dir()
+            
+    # Validate the shard before attempting download
+    if not is_valid_repo_id(shard.model_id):
+        print(f"Skipping download for invalid shard: {shard.model_id}")
+        return await ensure_downloads_dir()
+        
     target_dir, _ = await download_shard(shard, inference_engine_name, self.on_progress, max_parallel_downloads=self.max_parallel_downloads)
     return target_dir
 

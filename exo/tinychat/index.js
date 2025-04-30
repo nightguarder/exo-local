@@ -52,6 +52,13 @@ document.addEventListener("alpine:init", () => {
       // Clean up any pending messages
       localStorage.removeItem("pendingMessage");
 
+      // Restore selected model from localStorage if available
+      const savedModel = localStorage.getItem('selectedModel');
+      if (savedModel) {
+        this.cstate.selectedModel = savedModel;
+        console.log('Restored selected model from localStorage:', savedModel);
+      }
+
       // Get initial model list
       this.fetchInitialModels();
 
@@ -64,13 +71,76 @@ document.addEventListener("alpine:init", () => {
 
     async fetchInitialModels() {
       try {
-        const response = await fetch(`${window.location.origin}/initial_models`);
-        if (response.ok) {
-          const initialModels = await response.json();
-          this.models = initialModels;
+        // Fetch from the original endpoint
+        let remoteModels = {};
+        try {
+          const remoteResponse = await fetch(`${window.location.origin}/initial_models`);
+          if (remoteResponse.ok) {
+            remoteModels = await remoteResponse.json();
+          } else {
+            console.error("Failed to fetch remote models");
+          }
+        } catch (err) {
+          console.error("Remote models fetch error:", err);
         }
+    
+        // Fetch from the local endpoint
+        let localModels = {};
+        try {
+          // Add status code checks
+          const localResponse = await fetch(`http://localhost:8000/initial_models`);
+          if (localResponse.status === 200) {
+            localModels = await localResponse.json();
+            // Mark these models as local
+            Object.keys(localModels).forEach(key => {
+              if (localModels[key]) {
+                localModels[key].local = true;
+                console.log('Marked model as local:', key);
+              }
+            });
+          } else if (localResponse.status === 404) {
+            console.log("Local model server is not running");
+          } else {
+            console.error("Failed to fetch local models");
+          }
+          this.setDefaultModel();
+        } catch (err) {
+          console.error("Local models fetch error:", err);
+        }
+    
+        // Merge the models - local models override remote ones if there are duplicate keys
+        console.log("Initial models:", remoteModels, localModels);
+        this.models = { ...remoteModels, ...localModels };
       } catch (error) {
         console.error('Error fetching initial models:', error);
+      }
+    },
+
+    // Add the missing setDefaultModel function
+    setDefaultModel() {
+      // If no model is selected, use llama-3.2-1b or the first available model
+      if (!this.cstate.selectedModel || !this.models[this.cstate.selectedModel]) {
+        // Try to use llama-3.2-1b or find first available model
+        if (this.models && this.models['llama-3.2-1b']) {
+          this.cstate.selectedModel = 'llama-3.2-1b';
+          console.log('Set default model to llama-3.2-1b');
+        } else if (this.models && Object.keys(this.models).length > 0) {
+          // If llama-3.2-1b is not available, use the first model in the list
+          const firstModelKey = Object.keys(this.models)[0];
+          if (firstModelKey) {
+            this.cstate.selectedModel = firstModelKey;
+            console.log('Set default model to first available:', firstModelKey);
+          }
+        } else {
+          // Fallback if no models are available yet
+          console.log('No models available yet, using llama-3.2-1b as default');
+          this.cstate.selectedModel = 'llama-3.2-1b';
+        }
+        
+        // Save the selected model to localStorage
+        if (this.cstate.selectedModel) {
+          localStorage.setItem('selectedModel', this.cstate.selectedModel);
+        }
       }
     },
 
@@ -87,7 +157,7 @@ document.addEventListener("alpine:init", () => {
         }
       }
     },
-
+    
     async populateSelector() {
       return new Promise((resolve, reject) => {
         const evtSource = new EventSource(`${window.location.origin}/modelpool`);
@@ -206,11 +276,17 @@ document.addEventListener("alpine:init", () => {
 
     async processMessage(value) {
       try {
+        // Log the selected model before making the request
+        console.log('Using model for request:', this.cstate.selectedModel);
+        
         // reset performance tracking
         const prefill_start = Date.now();
         let start_time = 0;
         let tokens = 0;
         this.tokens_per_second = 0;
+
+        // Make sure the selectedModel is actually saved to localStorage
+        localStorage.setItem('selectedModel', this.cstate.selectedModel);
 
         // prepare messages for API request
         let apiMessages = this.cstate.messages.map(msg => {
@@ -313,7 +389,8 @@ document.addEventListener("alpine:init", () => {
             });
           }
 
-          console.log(apiMessages)
+          console.log('Sending API request with model:', this.cstate.selectedModel);
+          
           //start receiving server sent events
           let gottenFirstChunk = false;
           for await (
@@ -399,6 +476,8 @@ document.addEventListener("alpine:init", () => {
     },
 
     async *openaiChatCompletion(model, messages) {
+      console.log('openaiChatCompletion called with model:', model);
+      
       const response = await fetch(`${this.endpoint}/chat/completions`, {
         method: "POST",
         headers: {
@@ -410,6 +489,10 @@ document.addEventListener("alpine:init", () => {
           "stream": true,
         }),
       });
+      
+      // Log the response status to help debug
+      console.log('API response status:', response.status);
+      
       if (!response.ok) {
         const errorResBody = await response.json()
         if (errorResBody?.detail) {
@@ -689,9 +772,11 @@ document.addEventListener("alpine:init", () => {
     // Update the existing groupModelsByPrefix method to include counts
     groupModelsByPrefix(models) {
       const groups = {};
-      const filteredModels = this.showDownloadedOnly ?
-        Object.fromEntries(Object.entries(models).filter(([, model]) => model.downloaded)) :
-        models;
+      const filteredModels = this.showDownloadedOnly
+        ? Object.fromEntries(
+            Object.entries(models).filter(([, model]) => model.downloaded || model.local)
+          )
+        : models;
 
       Object.entries(filteredModels).forEach(([key, model]) => {
         const parts = key.split('-');

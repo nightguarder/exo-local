@@ -13,6 +13,7 @@ from .losses import loss_fns
 from ..shard import Shard
 from typing import Dict, Optional, Tuple
 from exo.download.shard_download import ShardDownloader
+from exo.models import register_local_model
 import asyncio
 from collections import OrderedDict
 from mlx_lm.models.cache import make_prompt_cache
@@ -42,10 +43,19 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
     if not self.local_model_dir.exists():
       print(f"Local model directory {self.local_model_dir} does not exist.")
       return
+    
+    for model_dir in self.local_model_dir.glob("*/*"):
+      if model_dir.is_dir() and (model_dir / "config.json").exists():
+        model_id = str(model_dir.relative_to(self.local_model_dir))
+        self._loaded_shards[model_id] = model_dir
+        print(f"Loaded local model: {model_id}")
+        
+    # Also scan direct subdirectories
     for model_dir in self.local_model_dir.glob("*"):
       if model_dir.is_dir() and (model_dir / "config.json").exists():
-        self._loaded_shards[model_dir.name] = model_dir
-        print(f"Loaded local model: {model_dir}")
+        model_id = model_dir.name
+        self._loaded_shards[model_id] = model_dir
+        print(f"Loaded local model: {model_id}")
 
   async def _eval_mlx(self, *args):
     await asyncio.get_running_loop().run_in_executor(self._mlx_thread, mx.eval, *args)
@@ -181,35 +191,84 @@ class MLXDynamicShardInferenceEngine(InferenceEngine):
   async def ensure_shard(self, shard: Shard):
     async with self._shard_lock:
       if self.shard == shard: return
-      # First try direct local cache load
-      local_path = self.local_model_dir / shard.model_id
-      if local_path.exists():
+      
+      print(f"Ensuring shard for model: {shard.model_id}")
+      
+      # Try different path formats for local models
+      local_paths = []
+      
+      # Original format
+      local_paths.append(self.local_model_dir / shard.model_id)
+      
+      # HF-style format with --
+      if '/' in shard.model_id:
+        local_paths.append(self.local_model_dir / shard.model_id.replace("/", "--"))
+      
+      # Directory structure format
+      if '/' in shard.model_id:
+        parts = shard.model_id.split('/')
+        if len(parts) == 2:
+          local_paths.append(self.local_model_dir / parts[0] / parts[1])
+      
+      # Handle case where model_id already contains --
+      if '--' in shard.model_id:
+        local_paths.append(self.local_model_dir / shard.model_id.replace("--", "/"))
+      
+      # Try each possible local path
+      for local_path in local_paths:
+        if local_path.exists():
+          try:
+            print(f"Loading local model from: {local_path}")
+            model_shard = await asyncio.get_running_loop().run_in_executor(
+              self._mlx_thread,
+              lambda: load_model_shard(local_path, shard, lazy=False)
+            )
+            if hasattr(model_shard, "tokenizer"):
+              self.tokenizer = model_shard.tokenizer
+            else:
+              self.tokenizer = await resolve_tokenizer(local_path)
+            self.shard = shard
+            self.model = model_shard
+            self.caches = OrderedDict()
+            self.session = {}
+            return
+          except Exception as e:
+            print(f"Local load failed for {local_path}: {e}")
+      
+      # If we get here, we couldn't find a local version, so try download
+      print(f"Could not find local model for {shard.model_id}, attempting download")
+      
+      # Check if the model ID has alternative formats we should try for download
+      alt_model_ids = [shard.model_id]
+      if '/' in shard.model_id:
+        alt_model_ids.append(shard.model_id.replace("/", "--"))
+      elif '--' in shard.model_id:
+        alt_model_ids.append(shard.model_id.replace("--", "/"))
+      
+      for model_id in alt_model_ids:
         try:
-          model_shard, self.tokenizer = await self._load_local_shard(local_path, shard)
-          self._update_model_state(shard, model_shard)
-          return
+          alt_shard = Shard(model_id, shard.start_layer, shard.end_layer, shard.n_layers)
+          model_path = await self.shard_downloader.ensure_shard(alt_shard, self.__class__.__name__)
+          if model_path and model_path.exists():
+            model_shard = await asyncio.get_running_loop().run_in_executor(
+              self._mlx_thread,
+              lambda: load_model_shard(model_path, alt_shard, lazy=False)
+            )
+            if hasattr(model_shard, "tokenizer"):
+              self.tokenizer = model_shard.tokenizer
+            else:
+              self.tokenizer = await resolve_tokenizer(model_path)
+            self.shard = alt_shard
+            self.model = model_shard
+            self.caches = OrderedDict()
+            self.session = {}
+            return
         except Exception as e:
-          print(f"Local load failed: {e}")
-          # Remove corrupted local files
-          if local_path.exists():
-            shutil.rmtree(local_path)
-            # Now fall back to download
-      ##Fallback
-      model_path = await self.shard_downloader.ensure_shard(shard, self.__class__.__name__)
-      if self.shard != shard:
-        model_shard = await asyncio.get_running_loop().run_in_executor(
-          self._mlx_thread,
-          lambda: load_model_shard(model_path, shard, lazy=False)
-        )
-        if hasattr(model_shard, "tokenizer"):
-          self.tokenizer = model_shard.tokenizer
-        else:
-          self.tokenizer = await resolve_tokenizer(model_path)
-        self.shard = shard
-        self.model = model_shard
-        self.caches = OrderedDict()
-        self.session = {}
-  
+          print(f"Failed to download model {model_id}: {e}")
+      
+      # If we get here, all attempts failed
+      raise ValueError(f"Could not find or download model {shard.model_id}")
+
   async def cleanup(self):
     self._mlx_thread.shutdown(wait=True)
     # Add this to prevent resource leaks

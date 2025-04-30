@@ -94,6 +94,17 @@ pip install -e .
 source install.sh
 ```
 
+## Running Exo
+
+### Using the Convenience Scripts
+
+For the best experience, use the provided convenience scripts that handle virtual environment setup automatically:
+
+**On macOS/Linux:**
+
+```sh
+source install.sh
+```
 
 ### Troubleshooting
 

@@ -82,9 +82,17 @@
                             <template x-for="(model, key) in groupModels" :key="key">
                                 <div class="model-option"
                                      :class="{ 'selected': cstate.selectedModel === key }"
-                                     @click="cstate.selectedModel = key">
+                                     x-show="!showDownloadedOnly || (model.downloaded || model.local)"
+                                     @click="
+                                       console.log('Selected model:', key); 
+                                       cstate.selectedModel = key;
+                                       localStorage.setItem('selectedModel', key);
+                                     ">
                                     <div class="model-header">
                                         <div class="model-name" x-text="model.name"></div>
+                                        <div class="model-badge" x-show="model.local">
+                                          <i class="fas fa-server"></i>
+                                        </div>
                                         <button
                                             @click.stop="deleteModel(key, model)"
                                             class="model-delete-button"
